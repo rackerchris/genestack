@@ -38,6 +38,125 @@ export TEST_LEVEL="${TEST_LEVEL:-full}"
 SSH_TARGET="${SSH_USERNAME:-ubuntu}@${JUMP_HOST_VIP:-}"
 SSH_OPTS_STR="-o ForwardAgent=yes -o UserKnownHostsFile=/dev/null -o StrictHostKeyChecking=no"
 
+reconcile_talos_worker_mgmt_port_security_groups() {
+    local worker_index="$1"
+    local -a desired_group_names=("${LAB_NAME_PREFIX}-secgroup" "${LAB_NAME_PREFIX}-http-secgroup")
+    local desired_ids current_ids
+
+    if [ "${worker_index}" -eq 0 ]; then
+        desired_group_names+=("${LAB_NAME_PREFIX}-jump-secgroup" "${LAB_NAME_PREFIX}-talos-secgroup")
+    fi
+
+    desired_ids="$(
+        for sg_name in "${desired_group_names[@]}"; do
+            openstack security group show "${sg_name}" -f value -c id
+        done | sort
+    )"
+    current_ids="$(
+        openstack port show "${WORKER_PORT_ID}" -f json 2>/dev/null | jq -r '.security_group_ids[]' | sort
+    )"
+
+    if [ "${current_ids}" != "${desired_ids}" ]; then
+        _log INFO "Configuring Talos worker ${worker_index} management port security groups"
+        openstack port set \
+            --security-group "${LAB_NAME_PREFIX}-secgroup" \
+            --security-group "${LAB_NAME_PREFIX}-http-secgroup" \
+            $([ "${worker_index}" -eq 0 ] && printf -- '--security-group %s --security-group %s ' "${LAB_NAME_PREFIX}-jump-secgroup" "${LAB_NAME_PREFIX}-talos-secgroup") \
+            "${WORKER_PORT_ID}" >/dev/null 2>&1 || {
+            _log ERROR "Failed to configure security groups on ${WORKER_PORT_ID}"
+            exit 1
+        }
+    else
+        _log INFO "Reusing Talos worker ${worker_index} management port security groups"
+    fi
+}
+
+discover_talos_worker_mgmt_port() {
+    local worker_index="$1"
+    local server_name="${LAB_NAME_PREFIX}-${worker_index}"
+    local port_id
+
+    port_id="$(_discover_server_port_on_network "${server_name}" "${LAB_NAME_PREFIX}-net")"
+    if [ -z "${port_id}" ]; then
+        _log ERROR "Failed to discover Talos management port for ${server_name}"
+        exit 1
+    fi
+
+    eval "WORKER_${worker_index}_PORT='${port_id}'"
+    eval "export WORKER_${worker_index}_PORT"
+}
+
+discover_talos_worker_compute_port() {
+    local worker_index="$1"
+    local server_name="${LAB_NAME_PREFIX}-${worker_index}"
+    local port_id
+
+    port_id="$(_discover_server_port_on_network "${server_name}" "${LAB_NAME_PREFIX}-compute-net")"
+    if [ -z "${port_id}" ]; then
+        _log ERROR "Failed to discover Talos compute port for ${server_name}"
+        exit 1
+    fi
+
+    eval "COMPUTE_${worker_index}_PORT='${port_id}'"
+    eval "export COMPUTE_${worker_index}_PORT"
+}
+
+reconcile_talos_worker_mgmt_port_allowed_address() {
+    local worker_index="$1"
+    local current_allowed
+
+    current_allowed="$(
+        openstack port show "${WORKER_PORT_ID}" -f json 2>/dev/null | jq -r '.allowed_address_pairs[].ip_address'
+    )"
+
+    if ! printf '%s\n' "${current_allowed}" | grep -qx "${METAL_LB_IP}"; then
+        _log INFO "Configuring Talos worker ${worker_index} management port allowed address ${METAL_LB_IP}"
+        openstack port set \
+            --allowed-address "ip-address=${METAL_LB_IP}" \
+            "${WORKER_PORT_ID}" >/dev/null 2>&1 || {
+            _log ERROR "Failed to configure allowed address on ${WORKER_PORT_ID}"
+            exit 1
+        }
+    else
+        _log INFO "Reusing Talos worker ${worker_index} management port allowed address ${METAL_LB_IP}"
+    fi
+}
+
+reconcile_talos_worker_mgmt_port() {
+    local worker_index="$1"
+    local port_name="${LAB_NAME_PREFIX}-${worker_index}-mgmt-port"
+
+    eval "WORKER_PORT_ID=\${WORKER_${worker_index}_PORT}"
+    if [ -z "${WORKER_PORT_ID}" ]; then
+        _log ERROR "Failed to determine management port for Talos worker ${worker_index}"
+        exit 1
+    fi
+
+    if ! _reconcile_port_name "${WORKER_PORT_ID}" "${port_name}" "Talos worker ${worker_index} management port"; then
+        _log ERROR "Failed to rename management port ${WORKER_PORT_ID}"
+        exit 1
+    fi
+
+    reconcile_talos_worker_mgmt_port_security_groups "${worker_index}"
+    reconcile_talos_worker_mgmt_port_allowed_address "${worker_index}"
+}
+
+reconcile_talos_worker_compute_port() {
+    local worker_index="$1"
+    local port_name="${LAB_NAME_PREFIX}-${worker_index}-compute-port"
+
+    eval "COMPUTE_PORT_ID=\${COMPUTE_${worker_index}_PORT}"
+    if [ -z "${COMPUTE_PORT_ID}" ]; then
+        _log ERROR "Failed to determine compute port for Talos worker ${worker_index}"
+        exit 1
+    fi
+
+    if ! _reconcile_port_name "${COMPUTE_PORT_ID}" "${port_name}" "Talos worker ${worker_index} compute port"; then
+        _log ERROR "Failed to rename compute port ${COMPUTE_PORT_ID}"
+        exit 1
+    fi
+}
+
 ###############################################################################
 # Phase 1: Initialize
 ###############################################################################
@@ -130,89 +249,20 @@ if ! openstack server show ${LAB_NAME_PREFIX}-jump -f value -c status >/dev/null
         --key-name ${LAB_NAME_PREFIX}-key >/dev/null 2>&1
 fi
 
-# Worker mgmt ports — parallel with jump host port check
-_worker_mgmt_pids=()
-for _i in 0 1 2; do
-    (
-        if ! openstack port show ${LAB_NAME_PREFIX}-${_i}-mgmt-port -f value -c id >/dev/null 2>&1; then
-            if [ "$_i" -eq 0 ]; then
-                openstack port create --allowed-address ip-address=${METAL_LB_IP} \
-                    --security-group ${LAB_NAME_PREFIX}-secgroup \
-                    --security-group ${LAB_NAME_PREFIX}-jump-secgroup \
-                    --security-group ${LAB_NAME_PREFIX}-http-secgroup \
-                    --security-group ${LAB_NAME_PREFIX}-talos-secgroup \
-                    --network ${LAB_NAME_PREFIX}-net \
-                    -f value -c id ${LAB_NAME_PREFIX}-0-mgmt-port > /tmp/hyperconverged-port-0.id 2>/dev/null
-            else
-                openstack port create --allowed-address ip-address=${METAL_LB_IP} \
-                    --security-group ${LAB_NAME_PREFIX}-secgroup \
-                    --security-group ${LAB_NAME_PREFIX}-http-secgroup \
-                    --network ${LAB_NAME_PREFIX}-net \
-                    -f value -c id ${LAB_NAME_PREFIX}-${_i}-mgmt-port > /tmp/hyperconverged-port-${_i}.id 2>/dev/null
-            fi
-        else
-            openstack port show ${LAB_NAME_PREFIX}-${_i}-mgmt-port -f value -c id > /tmp/hyperconverged-port-${_i}.id 2>/dev/null
-        fi
-    ) &
-    _worker_mgmt_pids+=($!)
-done
-
-# Collect and export
-for _idx in 0 1 2; do
-    wait "${_worker_mgmt_pids[$_idx]}" 2>/dev/null || true
-done
-
-WORKER_0_PORT=$(cat "/tmp/hyperconverged-port-0.id" 2>/dev/null || openstack port show ${LAB_NAME_PREFIX}-0-mgmt-port -f value -c id 2>/dev/null)
-WORKER_1_PORT=$(cat "/tmp/hyperconverged-port-1.id" 2>/dev/null || openstack port show ${LAB_NAME_PREFIX}-1-mgmt-port -f value -c id 2>/dev/null)
-WORKER_2_PORT=$(cat "/tmp/hyperconverged-port-2.id" 2>/dev/null || openstack port show ${LAB_NAME_PREFIX}-2-mgmt-port -f value -c id 2>/dev/null)
-export WORKER_0_PORT WORKER_1_PORT WORKER_2_PORT
-
-# Control plane floating IP
-if ! CONTROL_PLANE_VIP=$(openstack floating ip list --port "${WORKER_0_PORT}" -f value -c "Floating IP Address" 2>/dev/null); then
-    _log INFO "Creating control plane floating IP"
-    CONTROL_PLANE_VIP=$(openstack floating ip create PUBLICNET --port "${WORKER_0_PORT}" -f value -c "Floating IP Address" 2>/dev/null)
-elif [ -z "${CONTROL_PLANE_VIP}" ]; then
-    _log INFO "Creating control plane floating IP"
-    CONTROL_PLANE_VIP=$(openstack floating ip create PUBLICNET --port "${WORKER_0_PORT}" -f value -c "Floating IP Address" 2>/dev/null)
-fi
-export CONTROL_PLANE_VIP
-
-# Compute ports — parallel
-_compute_pids=()
-for _i in {100..109}; do
-    if ! openstack port show ${LAB_NAME_PREFIX}-0-compute-float-${_i}-port 2>/dev/null; then
-        openstack port create --network ${LAB_NAME_PREFIX}-compute-net \
-            --disable-port-security \
-            --fixed-ip ip-address="192.168.102.${_i}" \
-            ${LAB_NAME_PREFIX}-0-compute-float-${_i}-port &
-        _compute_pids+=($!)
-    fi
-done
-for _pid in "${_compute_pids[@]}"; do wait "$_pid" || true; done
-_compute_pids=()
-
-for _i in 0 1 2; do
-    if ! openstack port show ${LAB_NAME_PREFIX}-${_i}-compute-port 2>/dev/null; then
-        openstack port create --network ${LAB_NAME_PREFIX}-compute-net --disable-port-security \
-            ${LAB_NAME_PREFIX}-${_i}-compute-port &
-        _compute_pids+=($!)
-    fi
-done
-for _pid in "${_compute_pids[@]}"; do wait "$_pid" || true; done
-
-# Export compute ports
-for _i in 0 1 2; do
-    eval "COMPUTE_${_i}_PORT=\$(openstack port show ${LAB_NAME_PREFIX}-${_i}-compute-port -f value -c id 2>/dev/null || echo '')"
-    export COMPUTE_${_i}_PORT
-done
+# Explicit Neutron-managed fixed-IP reservation ports still need to exist.
+_parallel_compute_fixed_ip_ports "${LAB_NAME_PREFIX}"
 
 # Create Talos nodes — parallel
 _server_pids=()
 if ! openstack server show ${LAB_NAME_PREFIX}-0 -f value -c status >/dev/null 2>&1; then
     _log INFO "Creating Talos node ${LAB_NAME_PREFIX}-0"
     openstack server create ${LAB_NAME_PREFIX}-0 \
-        --port "${WORKER_0_PORT}" \
-        --port "${COMPUTE_0_PORT}" \
+        --network "${LAB_NAME_PREFIX}-net" \
+        --network "${LAB_NAME_PREFIX}-compute-net" \
+        --security-group "${LAB_NAME_PREFIX}-secgroup" \
+        --security-group "${LAB_NAME_PREFIX}-jump-secgroup" \
+        --security-group "${LAB_NAME_PREFIX}-http-secgroup" \
+        --security-group "${LAB_NAME_PREFIX}-talos-secgroup" \
         --image "${TALOS_IMAGE_NAME}" \
         --flavor "${OS_FLAVOR}" >/dev/null 2>&1 &
     _server_pids+=($!)
@@ -220,8 +270,10 @@ fi
 if ! openstack server show ${LAB_NAME_PREFIX}-1 -f value -c status >/dev/null 2>&1; then
     _log INFO "Creating Talos node ${LAB_NAME_PREFIX}-1"
     openstack server create ${LAB_NAME_PREFIX}-1 \
-        --port "${WORKER_1_PORT}" \
-        --port "${COMPUTE_1_PORT}" \
+        --network "${LAB_NAME_PREFIX}-net" \
+        --network "${LAB_NAME_PREFIX}-compute-net" \
+        --security-group "${LAB_NAME_PREFIX}-secgroup" \
+        --security-group "${LAB_NAME_PREFIX}-http-secgroup" \
         --image "${TALOS_IMAGE_NAME}" \
         --flavor "${OS_FLAVOR}" >/dev/null 2>&1 &
     _server_pids+=($!)
@@ -229,8 +281,10 @@ fi
 if ! openstack server show ${LAB_NAME_PREFIX}-2 -f value -c status >/dev/null 2>&1; then
     _log INFO "Creating Talos node ${LAB_NAME_PREFIX}-2"
     openstack server create ${LAB_NAME_PREFIX}-2 \
-        --port "${WORKER_2_PORT}" \
-        --port "${COMPUTE_2_PORT}" \
+        --network "${LAB_NAME_PREFIX}-net" \
+        --network "${LAB_NAME_PREFIX}-compute-net" \
+        --security-group "${LAB_NAME_PREFIX}-secgroup" \
+        --security-group "${LAB_NAME_PREFIX}-http-secgroup" \
         --image "${TALOS_IMAGE_NAME}" \
         --flavor "${OS_FLAVOR}" >/dev/null 2>&1 &
     _server_pids+=($!)
@@ -264,6 +318,28 @@ _parallel_wait_servers_active "${LAB_NAME_PREFIX:-genestack}" 3 600 5
 
 for _pid in "${_jump_pids[@]}"; do wait "$_pid" || true; done
 _log INFO "Nodes are ACTIVE"
+
+_log INFO "Discovering Talos worker ports"
+for _i in 0 1 2; do
+    discover_talos_worker_mgmt_port "${_i}"
+    discover_talos_worker_compute_port "${_i}"
+    reconcile_talos_worker_mgmt_port "${_i}"
+    reconcile_talos_worker_compute_port "${_i}"
+done
+_log INFO "Worker ports: 0=${WORKER_0_PORT} 1=${WORKER_1_PORT} 2=${WORKER_2_PORT}"
+_log INFO "Compute ports: 0=${COMPUTE_0_PORT} 1=${COMPUTE_1_PORT} 2=${COMPUTE_2_PORT}"
+
+# Control plane floating IP
+if ! CONTROL_PLANE_VIP=$(openstack floating ip list --port "${WORKER_0_PORT}" -f value -c "Floating IP Address" 2>/dev/null); then
+    _log INFO "Creating control plane floating IP"
+    CONTROL_PLANE_VIP=$(openstack floating ip create PUBLICNET --port "${WORKER_0_PORT}" -f value -c "Floating IP Address" 2>/dev/null)
+elif [ -z "${CONTROL_PLANE_VIP}" ]; then
+    _log INFO "Creating control plane floating IP"
+    CONTROL_PLANE_VIP=$(openstack floating ip create PUBLICNET --port "${WORKER_0_PORT}" -f value -c "Floating IP Address" 2>/dev/null)
+else
+    _log INFO "Reusing control plane floating IP ${CONTROL_PLANE_VIP}"
+fi
+export CONTROL_PLANE_VIP
 
 ###############################################################################
 # Phase 7: Wait for SSH
@@ -301,13 +377,16 @@ _log STEP "Phase 9: Wait for Talos API"
 _wait_ip_pids=()
 for _i in 0 1 2; do
     (
-        openstack port show ${LAB_NAME_PREFIX}-${_i}-mgmt-port -f json 2>/dev/null | jq -r '.fixed_ips[0].ip_address'
+        eval "_worker_port_id=\${WORKER_${_i}_PORT}"
+        openstack port show "${_worker_port_id}" -f json 2>/dev/null | jq -r '.fixed_ips[0].ip_address' >"/tmp/${LAB_NAME_PREFIX}-${_i}-mgmt-ip"
     ) &
     _wait_ip_pids+=($!)
 done
 for _i in 0 1 2; do
-    eval "WORKER_${_i}_IP=\$(wait ${_wait_ip_pids[$_i]})"
+    wait "${_wait_ip_pids[$_i]}"
+    eval "WORKER_${_i}_IP=\$(cat /tmp/${LAB_NAME_PREFIX}-${_i}-mgmt-ip)"
     export WORKER_${_i}_IP
+    rm -f "/tmp/${LAB_NAME_PREFIX}-${_i}-mgmt-ip"
 done
 _log INFO "Worker IPs: ${WORKER_0_IP}, ${WORKER_1_IP}, ${WORKER_2_IP}"
 

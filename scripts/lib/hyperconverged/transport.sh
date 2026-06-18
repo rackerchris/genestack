@@ -25,8 +25,9 @@ function _ssh_alias() {
 function configure_ssh_transport() {
     # Configure direct or bastion-backed SSH transport to the jump host.
     mkdir -p ~/.ssh 2>/dev/null || true
+    configure_ssh_key_paths
     SSH_TARGET="${SSH_USERNAME:-ubuntu}@${JUMP_HOST_VIP:-}"
-    local ssh_identity_file="${HOME}/.ssh/${LAB_NAME_PREFIX:-hyperconverged}-key.pem"
+    local ssh_identity_file="${SSH_KEY_PATH}"
 
     if [ -n "${SSH_GATEWAY:-}" ]; then
         SSH_USER="${SSH_USER:-${USER}}"
@@ -66,11 +67,12 @@ function write_jump_host_ssh_config() {
     # Write SSH client config on jump host for worker access
     # Used by the kubespray orchestrator
     local _hosts_conf=""
+    local _remote_identity_file="~/.ssh/${SSH_KEY_FILENAME:-${LAB_NAME_PREFIX}-key.pem}"
     _hosts_conf=$(cat <<SSHEOF
 Host ${LAB_NAME_PREFIX}-0
     HostName WORKER_0_IP_PLACEHOLDER
     User PLACEHOLDER_SSH_USER
-    IdentityFile ~/.ssh/PLACEHOLDER_PREFIX-key.pem
+    IdentityFile ${_remote_identity_file}
     StrictHostKeyChecking no
     ForwardAgent yes
     AddKeysToAgent yes
@@ -78,7 +80,7 @@ Host ${LAB_NAME_PREFIX}-0
 Host ${LAB_NAME_PREFIX}-1
     HostName WORKER_1_IP_PLACEHOLDER
     User PLACEHOLDER_SSH_USER
-    IdentityFile ~/.ssh/PLACEHOLDER_PREFIX-key.pem
+    IdentityFile ${_remote_identity_file}
     StrictHostKeyChecking no
     ForwardAgent yes
     AddKeysToAgent yes
@@ -86,7 +88,7 @@ Host ${LAB_NAME_PREFIX}-1
 Host ${LAB_NAME_PREFIX}-2
     HostName WORKER_2_IP_PLACEHOLDER
     User PLACEHOLDER_SSH_USER
-    IdentityFile ~/.ssh/PLACEHOLDER_PREFIX-key.pem
+    IdentityFile ${_remote_identity_file}
     StrictHostKeyChecking no
     ForwardAgent yes
     AddKeysToAgent yes

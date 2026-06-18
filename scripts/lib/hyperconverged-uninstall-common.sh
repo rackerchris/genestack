@@ -49,6 +49,12 @@ function _wait_for_servers_term() {
                 all_deleted=false
             fi
         done
+        if openstack server show ${LAB_NAME_PREFIX:-hyperconverged}-jump -f value -c status >/dev/null 2>&1; then
+            jump_status=$(openstack server show ${LAB_NAME_PREFIX:-hyperconverged}-jump -f value -c status 2>/dev/null || echo "DELETED")
+            if [ "${jump_status}" != "DELETED" ] && [ "${jump_status}" != "ERROR" ]; then
+                all_deleted=false
+            fi
+        fi
         if ${all_deleted}; then
             _log INFO "  All servers terminated"
             return 0

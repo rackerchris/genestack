@@ -10,6 +10,8 @@ function createRouter() {
     if ! openstack router show ${LAB_NAME_PREFIX}-router -f value -c name >/dev/null 2>&1; then
         _log INFO "Creating router ${LAB_NAME_PREFIX}-router"
         openstack router create ${LAB_NAME_PREFIX}-router --external-gateway PUBLICNET >/dev/null 2>&1 || { _log ERROR "Router creation failed"; return 1; }
+    else
+        _log INFO "Reusing router ${LAB_NAME_PREFIX}-router"
     fi
 }
 
@@ -17,6 +19,8 @@ function createNetworks() {
     if ! openstack network show ${LAB_NAME_PREFIX}-net -f value -c name >/dev/null 2>&1; then
         _log INFO "Creating network ${LAB_NAME_PREFIX}-net"
         openstack network create ${LAB_NAME_PREFIX}-net --mtu ${LAB_NETWORK_MTU} >/dev/null 2>&1 || { _log ERROR "Network creation failed"; return 1; }
+    else
+        _log INFO "Reusing network ${LAB_NAME_PREFIX}-net"
     fi
 
     if ! openstack subnet show ${LAB_NAME_PREFIX}-subnet -f value -c name >/dev/null 2>&1; then
@@ -26,16 +30,29 @@ function createNetworks() {
             --subnet-range 192.168.100.0/24 \
             --dns-nameserver 1.1.1.1 \
             --dns-nameserver 1.0.0.1 >/dev/null 2>&1 || { _log ERROR "Subnet creation failed"; return 1; }
+    else
+        _log INFO "Reusing subnet ${LAB_NAME_PREFIX}-subnet"
     fi
 
     if ! openstack router show ${LAB_NAME_PREFIX}-router -f json 2>/dev/null | jq -r '.interfaces_info[].subnet_id' | grep -q $(openstack subnet show ${LAB_NAME_PREFIX}-subnet -f value -c id 2>/dev/null) 2>/dev/null; then
-        _log INFO "Adding subnet ${LAB_NAME_PREFIX}-subnet to router"
+        _log INFO "Attaching subnet ${LAB_NAME_PREFIX}-subnet to router"
         openstack router add subnet ${LAB_NAME_PREFIX}-router ${LAB_NAME_PREFIX}-subnet >/dev/null 2>&1 || { _log ERROR "Failed to add subnet to router"; return 1; }
+    else
+        _log INFO "Router already attached to subnet ${LAB_NAME_PREFIX}-subnet"
     fi
 
     if ! openstack network show ${LAB_NAME_PREFIX}-compute-net -f value -c name >/dev/null 2>&1; then
         _log INFO "Creating compute network ${LAB_NAME_PREFIX}-compute-net"
-        openstack network create ${LAB_NAME_PREFIX}-compute-net --disable-port-security --mtu ${LAB_NETWORK_MTU} >/dev/null 2>&1 || { _log ERROR "Compute network creation failed"; return 1; }
+        openstack network create ${LAB_NAME_PREFIX}-compute-net --mtu ${LAB_NETWORK_MTU} >/dev/null 2>&1 || { _log ERROR "Compute network creation failed"; return 1; }
+    else
+        _log INFO "Reusing compute network ${LAB_NAME_PREFIX}-compute-net"
+    fi
+
+    if [ "$(openstack network show ${LAB_NAME_PREFIX}-compute-net -f value -c port_security_enabled 2>/dev/null)" != "True" ]; then
+        _log INFO "Configuring compute network ${LAB_NAME_PREFIX}-compute-net port security"
+        openstack network set --enable-port-security ${LAB_NAME_PREFIX}-compute-net >/dev/null 2>&1 || { _log ERROR "Failed to enable compute network port security"; return 1; }
+    else
+        _log INFO "Reusing compute network ${LAB_NAME_PREFIX}-compute-net port security"
     fi
 
     if ! openstack subnet show ${LAB_NAME_PREFIX}-compute-subnet -f value -c name >/dev/null 2>&1; then
@@ -44,11 +61,15 @@ function createNetworks() {
             --network ${LAB_NAME_PREFIX}-compute-net \
             --subnet-range 192.168.102.0/24 \
             --no-dhcp >/dev/null 2>&1 || { _log ERROR "Compute subnet creation failed"; return 1; }
+    else
+        _log INFO "Reusing compute subnet ${LAB_NAME_PREFIX}-compute-subnet"
     fi
 
     if ! openstack router show ${LAB_NAME_PREFIX}-router -f json 2>/dev/null | jq -r '.interfaces_info[].subnet_id' | grep -q $(openstack subnet show ${LAB_NAME_PREFIX}-compute-subnet -f value -c id 2>/dev/null) 2>/dev/null; then
-        _log INFO "Adding compute subnet ${LAB_NAME_PREFIX}-compute-subnet to router"
+        _log INFO "Attaching compute subnet ${LAB_NAME_PREFIX}-compute-subnet to router"
         openstack router add subnet ${LAB_NAME_PREFIX}-router ${LAB_NAME_PREFIX}-compute-subnet >/dev/null 2>&1 || { _log ERROR "Failed to add compute subnet to router"; return 1; }
+    else
+        _log INFO "Router already attached to compute subnet ${LAB_NAME_PREFIX}-compute-subnet"
     fi
 }
 
@@ -59,6 +80,8 @@ function createMetalLBPort() {
             --security-group ${LAB_NAME_PREFIX}-http-secgroup \
             --network ${LAB_NAME_PREFIX}-net \
             ${LAB_NAME_PREFIX}-metallb-vip-0-port >/dev/null 2>&1 || { _log ERROR "MetalLB VIP port creation failed"; return 1; }
+    else
+        _log INFO "Reusing MetalLB VIP port ${LAB_NAME_PREFIX}-metallb-vip-0-port"
     fi
     METAL_LB_PORT_ID=$(openstack port show ${LAB_NAME_PREFIX}-metallb-vip-0-port -f value -c id 2>/dev/null)
     export METAL_LB_PORT_ID
@@ -68,6 +91,8 @@ function createMetalLBPort() {
     if ! openstack floating ip list --port ${METAL_LB_PORT_ID} -f value -c "Floating IP Address" >/dev/null 2>&1; then
         _log INFO "Creating MetalLB VIP floating IP"
         openstack floating ip create PUBLICNET --port ${METAL_LB_PORT_ID} >/dev/null 2>&1 || { _log ERROR "MetalLB floating IP creation failed"; return 1; }
+    else
+        _log INFO "Reusing MetalLB VIP floating IP"
     fi
     METAL_LB_VIP=$(openstack floating ip list --port ${METAL_LB_PORT_ID} -f value -c "Floating IP Address" 2>/dev/null)
     export METAL_LB_VIP

@@ -22,6 +22,14 @@ source "${_Helpers_DIR}/functions.sh"
 # =========================================================================
 _LOG_LEVEL="${_LOG_LEVEL:-INFO}"
 
+# Lifecycle wording convention for idempotent operator logs:
+# - Creating ...    when a step materializes a new resource
+# - Reusing ...     when an existing resource is valid and kept as-is
+# - Attaching ...   when a relationship is being added
+# - Configuring ... when an existing resource is being changed
+# - Skipping ...    when an optional path is intentionally not run
+# - Running ...     when a step is intentionally unconditional / non-idempotent
+
 function _log() {
     local level="${1}"
     shift
@@ -83,6 +91,10 @@ function parseCommonArgs() {
 # Prompting
 # =========================================================================
 function promptForCommonInputs() {
+    local ALL_FLAVORS
+    local DISPLAY_FLAVORS
+    local DEFAULT_OS_FLAVOR
+
     if [ -z "${ACME_EMAIL}" ]; then
         read -rp "Enter a valid email address for use with ACME, press enter to skip: " ACME_EMAIL || _log SKIP
     fi
@@ -98,14 +110,43 @@ function promptForCommonInputs() {
         export OS_CLOUD="${OS_CLOUD:-default}"
     fi
 
+    ALL_FLAVORS=$(openstack flavor list --sort-column Name -c Name -c RAM -c Disk -c VCPUs -f json 2>/dev/null || echo "[]")
+    DISPLAY_FLAVORS=$(echo "${ALL_FLAVORS}" | jq '[.[] | select((.RAM | tonumber) >= 16000 and (.Disk | tonumber) >= 100)]')
+    DEFAULT_OS_FLAVOR=$(echo "${DISPLAY_FLAVORS}" | jq -r '[.[] | select((.RAM | tonumber) < 24576)] | .[0].Name // empty')
+
+    if [ -z "${DEFAULT_OS_FLAVOR}" ]; then
+        DEFAULT_OS_FLAVOR=$(echo "${DISPLAY_FLAVORS}" | jq -r '.[0].Name // empty')
+    fi
+    if [ -z "${DEFAULT_OS_FLAVOR}" ]; then
+        DEFAULT_OS_FLAVOR=$(echo "${ALL_FLAVORS}" | jq -r '.[0].Name // empty')
+    fi
+
     if [ -z "${OS_FLAVOR}" ]; then
         _log INFO "Listing available flavors"
-        local FLAVORS
-        FLAVORS=$(openstack flavor list --min-ram 16000 --min-disk 100 --sort-column Name -c Name -c RAM -c Disk -c VCPUs -f json 2>/dev/null)
-        local DEFAULT_OS_FLAVOR
-        DEFAULT_OS_FLAVOR=$(echo "${FLAVORS}" | jq -r '[.[] | select( all(.RAM; . < 24576) )] | .[0].Name')
+        if [ "${DISPLAY_FLAVORS}" != "[]" ]; then
+            _log INFO "Available preferred flavors (Name RAM(MB) Disk(GB) VCPUs):"
+            echo "${DISPLAY_FLAVORS}" | jq -r '.[] | "  - \(.Name) \(.RAM) \(.Disk) \(.VCPUs)"'
+        elif [ "${ALL_FLAVORS}" != "[]" ]; then
+            _log WARN "No flavors matched the preferred size filter; showing all available flavors"
+            echo "${ALL_FLAVORS}" | jq -r '.[] | "  - \(.Name) \(.RAM) \(.Disk) \(.VCPUs)"'
+        else
+            _log WARN "No flavors were returned by OpenStack; enter a flavor name manually if needed"
+        fi
         read -rp "Enter name of the flavor to use for the instances [${DEFAULT_OS_FLAVOR}]: " OS_FLAVOR || _log SKIP
         export OS_FLAVOR="${OS_FLAVOR:-${DEFAULT_OS_FLAVOR}}"
+    elif ! openstack flavor show "${OS_FLAVOR}" >/dev/null 2>&1; then
+        _log ERROR "Configured OS_FLAVOR was not found: ${OS_FLAVOR}"
+        if [ "${DISPLAY_FLAVORS}" != "[]" ]; then
+            _log INFO "Available preferred flavors (Name RAM(MB) Disk(GB) VCPUs):"
+            echo "${DISPLAY_FLAVORS}" | jq -r '.[] | "  - \(.Name) \(.RAM) \(.Disk) \(.VCPUs)"'
+        elif [ "${ALL_FLAVORS}" != "[]" ]; then
+            _log INFO "Available flavors (Name RAM(MB) Disk(GB) VCPUs):"
+            echo "${ALL_FLAVORS}" | jq -r '.[] | "  - \(.Name) \(.RAM) \(.Disk) \(.VCPUs)"'
+        fi
+        if [ -n "${DEFAULT_OS_FLAVOR}" ]; then
+            _log INFO "Suggested replacement flavor: ${DEFAULT_OS_FLAVOR}"
+        fi
+        exit 1
     fi
 }
 
@@ -117,11 +158,11 @@ function detectJumpHostSSHUsername() {
         local IMAGE_DEFAULT_PROPERTY
         IMAGE_DEFAULT_PROPERTY=$(openstack image show "${JUMP_HOST_IMAGE}" -f json 2>/dev/null | jq -r '.properties.default_user // empty')
         if [ -n "${IMAGE_DEFAULT_PROPERTY}" ]; then
-            read -rp "Confirm SSH username [${IMAGE_DEFAULT_PROPERTY}]: " SSH_USERNAME || _log SKIP
-            export SSH_USERNAME="${SSH_USERNAME:-${IMAGE_DEFAULT_PROPERTY}}"
+            export SSH_USERNAME="${IMAGE_DEFAULT_PROPERTY}"
+            _log INFO "Using image default SSH username: ${SSH_USERNAME}"
         else
-            read -rp "Enter the SSH username for the jump host [ubuntu]: " SSH_USERNAME || _log SKIP
-            export SSH_USERNAME="${SSH_USERNAME:-ubuntu}"
+            export SSH_USERNAME="ubuntu"
+            _log INFO "Using fallback SSH username: ${SSH_USERNAME}"
         fi
     fi
 }
@@ -163,14 +204,36 @@ function _configure_apt_sources() {
 # Parallel WAIT — Server ACTIVE
 # =========================================================================
 function _parallel_wait_servers_active() {
-    local count="${1:-3}" max_wait="${2:-600}" interval="${3:-5}"
     local prefix="${LAB_NAME_PREFIX:-hyperconverged}"
+    local count
+    local max_wait
+    local interval
+
+    # Support both call styles:
+    #   _parallel_wait_servers_active 3 600 5
+    #   _parallel_wait_servers_active my-prefix 3 600 5
+    if [[ "${1:-}" =~ ^[0-9]+$ ]]; then
+        count="${1:-3}"
+        max_wait="${2:-600}"
+        interval="${3:-5}"
+    else
+        prefix="${1:-${prefix}}"
+        count="${2:-3}"
+        max_wait="${3:-600}"
+        interval="${4:-5}"
+    fi
+
+    if ! [[ "${count}" =~ ^[0-9]+$ ]] || [ "${count}" -le 0 ]; then
+        _log ERROR "Invalid server count for ACTIVE wait: ${count}"
+        return 1
+    fi
+
     local ready=0 elapsed=0
 
     _log STEP "Waiting for ${count} ${prefix} nodes to reach ACTIVE (timeout: ${max_wait}s)"
     declare -a waiters
 
-    for i in $(seq 0 $((count - 1))); do
+    for ((i = 0; i < count; i++)); do
         (
             _attempts=0
             while true; do
@@ -196,7 +259,7 @@ function _parallel_wait_servers_active() {
     while [ $ready -lt $count ]; do
         sleep "${interval}"
         elapsed=$((elapsed + interval))
-        for i in $(seq 0 $((count - 1))); do
+        for ((i = 0; i < count; i++)); do
             if [ -f "/tmp/hyperconverged-${i}.done" ]; then
                 _status=$(cat "/tmp/hyperconverged-${i}.done")
                 if [ "$_status" = "ACTIVE" ]; then
@@ -205,7 +268,7 @@ function _parallel_wait_servers_active() {
                     rm -f "/tmp/hyperconverged-${i}.done"
                 elif [ "$_status" = "ERROR" ]; then
                     _log ERROR "${prefix}-${i} reached ERROR — aborting"
-                    for p in $(seq 0 $((count - 1))); do
+                    for ((p = 0; p < count; p++)); do
                         kill "${waiters[$p]}" 2>/dev/null || true
                         rm -f "/tmp/hyperconverged-${p}.done"
                     done
@@ -214,14 +277,14 @@ function _parallel_wait_servers_active() {
             fi
         done
         if [ $((elapsed % 30)) -eq 0 ] && [ $ready -lt $count ]; then
-            _log "  ...still waiting (took ${elapsed}s, ${ready}/${count} ready)"
+            _log INFO "  ...still waiting (took ${elapsed}s, ${ready}/${count} ready)"
         fi
         if [ "${elapsed}" -ge "${max_wait}" ]; then
-            _log "ERROR: Timeout — ${count} servers not ACTIVE after ${elapsed}s"
-            for i in $(seq 0 $((count - 1))); do
-                [ ! -f "/tmp/hyperconverged-${i}.done" ] && _log "ERROR:  Node ${i} never reached ACTIVE"
+            _log ERROR "Timeout — ${count} servers not ACTIVE after ${elapsed}s"
+            for ((i = 0; i < count; i++)); do
+                [ ! -f "/tmp/hyperconverged-${i}.done" ] && _log ERROR "Node ${i} never reached ACTIVE"
             done
-            for i in $(seq 0 $((count - 1))); do rm -f "/tmp/hyperconverged-${i}.done"; done
+            for ((i = 0; i < count; i++)); do rm -f "/tmp/hyperconverged-${i}.done"; done
             return 1
         fi
     done
@@ -276,35 +339,60 @@ function _wait_volume_ready() {
 }
 
 # =========================================================================
-# Parallel Compute Ports — {100..109} + per-node (saves ~50-60s)
+# Compute Fixed-IP Reservation Ports — explicit Neutron-managed ports {100..109}
 # =========================================================================
-function _parallel_compute_ports() {
+function _parallel_compute_fixed_ip_ports() {
     local prefix="$1"
     local _pids=()
 
     for i in {100..109}; do
         if ! openstack port show ${prefix}-0-compute-float-${i}-port -f value -c id >/dev/null 2>&1; then
-            _log INFO "Creating compute float port 192.168.102.${i}"
+            _log INFO "Creating compute fixed IP port 192.168.102.${i}"
             openstack port create --network ${prefix}-compute-net \
                 --disable-port-security \
                 --fixed-ip ip-address="192.168.102.${i}" \
                 ${prefix}-0-compute-float-${i}-port >/dev/null 2>&1 &
             _pids+=($!)
+        else
+            _log INFO "Reusing compute fixed IP port 192.168.102.${i}"
         fi
     done
     for _pid in "${_pids[@]}"; do wait "$_pid" || true; done
-    _pids=()
+    _log INFO "Compute fixed IP reservation ports ready"
+}
 
-    for i in 0 1 2; do
-        if ! openstack port show ${prefix}-${i}-compute-port -f value -c id >/dev/null 2>&1; then
-            _log INFO "Creating ${i}-compute-port"
-            openstack port create --network ${prefix}-compute-net --disable-port-security \
-                ${prefix}-${i}-compute-port >/dev/null 2>&1 &
-            _pids+=($!)
-        fi
-    done
-    for _pid in "${_pids[@]}"; do wait "$_pid" || true; done
-    _log INFO "Compute ports ready"
+# Backward-compatible wrapper while callers are migrated.
+function _parallel_compute_ports() {
+    _parallel_compute_fixed_ip_ports "$@"
+}
+
+# =========================================================================
+# Port Discovery / Reconciliation
+# =========================================================================
+function _discover_server_port_on_network() {
+    local server_name="$1"
+    local network_name="$2"
+
+    openstack port list \
+        --server "${server_name}" \
+        --network "${network_name}" \
+        -f value \
+        -c ID 2>/dev/null | head -n1
+}
+
+function _reconcile_port_name() {
+    local port_id="$1"
+    local desired_name="$2"
+    local description="$3"
+    local current_name
+
+    current_name="$(openstack port show "${port_id}" -f value -c name 2>/dev/null)"
+    if [ "${current_name}" != "${desired_name}" ]; then
+        _log INFO "Configuring ${description} name ${desired_name}"
+        openstack port set --name "${desired_name}" "${port_id}" >/dev/null 2>&1 || return 1
+    else
+        _log INFO "Reusing ${description} name ${desired_name}"
+    fi
 }
 
 # =========================================================================
