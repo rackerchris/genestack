@@ -1,0 +1,12 @@
+---
+openstack_cluster_configuration:
+  schema_version: 1
+  flavors: []
+  volume_qos: []
+  volume_types: []
+  octavia_flavor_profiles: []
+  octavia_flavors: []
+  networks: []
+  routers: []
+  network_qos_policies: []
+  security_groups: []

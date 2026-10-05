@@ -1,0 +1,7 @@
+---
+features:
+  - |
+    Added the ``ops-tools/cluster_configuration`` recovery tool. Operators can
+    export admin-level OpenStack cluster configuration to a dedicated
+    ``cluster_configuration.yml`` inventory and reapply it after a cloud rebuild
+    through an Ansible-backed dry-run/apply workflow.

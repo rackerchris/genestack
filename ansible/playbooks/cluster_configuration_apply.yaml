@@ -1,0 +1,361 @@
+---
+- name: Apply OpenStack cluster configuration
+  hosts: localhost
+  connection: local
+  gather_facts: false
+  vars:
+    os_cloud: "{{ os_cloud | default('default') }}"
+  tasks:
+    - name: Require cluster_config_file
+      ansible.builtin.assert:
+        that:
+          - cluster_config_file is defined
+          - cluster_config_file | length > 0
+        fail_msg: "cluster_config_file must point to cluster_configuration.yml"
+
+    - name: Load cluster configuration inventory
+      ansible.builtin.include_vars:
+        file: "{{ cluster_config_file }}"
+        name: cluster_inventory
+
+    - name: Set cluster configuration fact
+      ansible.builtin.set_fact:
+        cluster_config: "{{ cluster_inventory.openstack_cluster_configuration | default({}) }}"
+
+    - name: Ensure compute flavors are present
+      openstack.cloud.compute_flavor:
+        cloud: "{{ os_cloud }}"
+        state: present
+        name: "{{ item.name }}"
+        description: "{{ item.description | default(omit) }}"
+        ram: "{{ item.ram }}"
+        disk: "{{ item.disk }}"
+        vcpus: "{{ item.vcpus }}"
+        ephemeral: "{{ item.ephemeral | default(0) }}"
+        swap: "{{ item.swap | default(0) }}"
+        is_public: "{{ item.is_public | default(true) | bool }}"
+        extra_specs: "{{ item.extra_specs | default({}) }}"
+        interface: public
+      loop: "{{ cluster_config.flavors | default([]) }}"
+      loop_control:
+        label: "{{ item.name }}"
+
+    - name: Ensure private flavor access is present
+      ansible.builtin.command: >-
+        openstack --os-cloud {{ os_cloud }} flavor set
+        --project {{ item.1 | quote }}
+        {{ item.0.name | quote }}
+      register: flavor_access_set
+      changed_when: flavor_access_set.rc == 0
+      failed_when: flavor_access_set.rc != 0 and 'already has access' not in (flavor_access_set.stderr | default(''))
+      with_subelements:
+        - "{{ cluster_config.flavors | default([]) }}"
+        - access_projects
+        - skip_missing: true
+      when:
+        - not ansible_check_mode
+        - not (item.0.is_public | default(true) | bool)
+
+    - name: Ensure provider networks are present
+      openstack.cloud.network:
+        cloud: "{{ os_cloud }}"
+        state: present
+        name: "{{ item.name }}"
+        project: "{{ item.project | default(omit) }}"
+        provider_physical_network: "{{ item.provider_physical_network | default(omit) }}"
+        provider_network_type: "{{ item.provider_network_type | default(omit) }}"
+        provider_segmentation_id: "{{ item.provider_segmentation_id | default(omit) }}"
+        external: "{{ item.external | default(false) | bool }}"
+        shared: "{{ item.shared | default(false) | bool }}"
+        mtu_size: "{{ item.mtu | default(omit) }}"
+        interface: public
+      loop: "{{ cluster_config.networks | default([]) }}"
+      loop_control:
+        label: "{{ item.name }}"
+
+    - name: Validate subnet allocation pool compatibility
+      ansible.builtin.assert:
+        that:
+          - item.1.allocation_pools | default([]) | length <= 1
+        fail_msg: >-
+          The openstack.cloud.subnet module only supports a single allocation
+          pool. Subnet {{ item.1.name }} on network {{ item.0.name }} has
+          multiple allocation pools.
+      with_subelements:
+        - "{{ cluster_config.networks | default([]) }}"
+        - subnets
+        - skip_missing: true
+
+    - name: Ensure provider subnets are present
+      openstack.cloud.subnet:
+        cloud: "{{ os_cloud }}"
+        state: present
+        network_name: "{{ item.0.name }}"
+        name: "{{ item.1.name }}"
+        cidr: "{{ item.1.cidr }}"
+        gateway_ip: "{{ item.1.gateway_ip | default(omit) }}"
+        is_dhcp_enabled: "{{ item.1.enable_dhcp | default(true) | bool }}"
+        allocation_pool_start: "{{ item.1.allocation_pools[0].start if (item.1.allocation_pools | default([]) | length) > 0 else omit }}"
+        allocation_pool_end: "{{ item.1.allocation_pools[0].end if (item.1.allocation_pools | default([]) | length) > 0 else omit }}"
+        dns_nameservers: "{{ item.1.dns_nameservers | default(omit) }}"
+        host_routes: "{{ item.1.host_routes | default(omit) }}"
+        interface: public
+      with_subelements:
+        - "{{ cluster_config.networks | default([]) }}"
+        - subnets
+        - skip_missing: true
+
+    - name: Ensure network QoS policy associations are present
+      ansible.builtin.command: >-
+        openstack --os-cloud {{ os_cloud }} network set
+        --qos-policy {{ item.qos_policy | quote }}
+        {{ item.name | quote }}
+      register: network_qos_set
+      changed_when: network_qos_set.rc == 0
+      loop: "{{ cluster_config.networks | default([]) }}"
+      loop_control:
+        label: "{{ item.name }}"
+      when:
+        - not ansible_check_mode
+        - item.qos_policy is defined
+
+    - name: Ensure security groups are present
+      openstack.cloud.security_group:
+        cloud: "{{ os_cloud }}"
+        state: present
+        name: "{{ item.name }}"
+        project: "{{ item.project | default(omit) }}"
+        description: "{{ item.description | default(omit) }}"
+        interface: public
+      loop: "{{ cluster_config.security_groups | default([]) }}"
+      loop_control:
+        label: "{{ item.name }}"
+
+    - name: Ensure security group rules are present
+      openstack.cloud.security_group_rule:
+        cloud: "{{ os_cloud }}"
+        state: present
+        security_group: "{{ item.0.name }}"
+        project: "{{ item.0.project | default(omit) }}"
+        direction: "{{ item.1.direction | default(omit) }}"
+        protocol: "{{ item.1.protocol | default(omit) }}"
+        port_range_min: "{{ item.1.port_range_min | default(omit) }}"
+        port_range_max: "{{ item.1.port_range_max | default(omit) }}"
+        ethertype: "{{ item.1.ethertype | default(omit) }}"
+        remote_ip_prefix: "{{ item.1.remote_ip_prefix | default(omit) }}"
+        remote_group: "{{ item.1.remote_group | default(omit) }}"
+        interface: public
+      with_subelements:
+        - "{{ cluster_config.security_groups | default([]) }}"
+        - rules
+        - skip_missing: true
+
+    - name: Ensure routers are present
+      openstack.cloud.router:
+        cloud: "{{ os_cloud }}"
+        state: present
+        name: "{{ item.name }}"
+        project: "{{ item.project | default(omit) }}"
+        network: "{{ item.external_gateway_info.network_name | default(omit) }}"
+        enable_snat: "{{ item.external_gateway_info.enable_snat | default(omit) }}"
+        interfaces: "{{ item.interfaces | default(omit) }}"
+        interface: public
+      loop: "{{ cluster_config.routers | default([]) }}"
+      loop_control:
+        label: "{{ item.name }}"
+
+    - name: Ensure Neutron QoS policies are present
+      ansible.builtin.command: >-
+        openstack --os-cloud {{ os_cloud }} network qos policy create
+        {% if item.description is defined %}--description {{ item.description | quote }}{% endif %}
+        {% if item.shared | default(false) | bool %}--share{% endif %}
+        {% if item.is_default | default(false) | bool %}--default{% endif %}
+        {{ item.name }}
+      register: network_qos_create
+      changed_when: network_qos_create.rc == 0
+      failed_when: network_qos_create.rc != 0 and 'already exists' not in (network_qos_create.stderr | default(''))
+      loop: "{{ cluster_config.network_qos_policies | default([]) }}"
+      loop_control:
+        label: "{{ item.name }}"
+      when: not ansible_check_mode
+
+    - name: Ensure Neutron bandwidth limit QoS rules are present
+      ansible.builtin.command: >-
+        openstack --os-cloud {{ os_cloud }} network qos rule create
+        --type bandwidth-limit
+        {% if item.1.direction is defined %}--{{ item.1.direction }}{% endif %}
+        --max-kbps {{ item.1.max_kbps }}
+        {% if item.1.max_burst_kbits is defined %}--max-burst-kbits {{ item.1.max_burst_kbits }}{% endif %}
+        {{ item.0.name }}
+      register: network_qos_bandwidth_rule
+      changed_when: network_qos_bandwidth_rule.rc == 0
+      failed_when: network_qos_bandwidth_rule.rc != 0 and 'already exists' not in (network_qos_bandwidth_rule.stderr | default(''))
+      with_subelements:
+        - "{{ cluster_config.network_qos_policies | default([]) }}"
+        - rules
+        - skip_missing: true
+      when:
+        - not ansible_check_mode
+        - item.1.type | default('') == 'bandwidth_limit'
+        - item.1.max_kbps is defined
+
+    - name: Ensure Neutron DSCP marking QoS rules are present
+      ansible.builtin.command: >-
+        openstack --os-cloud {{ os_cloud }} network qos rule create
+        --type dscp-marking
+        --dscp-mark {{ item.1.dscp_mark }}
+        {{ item.0.name }}
+      register: network_qos_dscp_rule
+      changed_when: network_qos_dscp_rule.rc == 0
+      failed_when: network_qos_dscp_rule.rc != 0 and 'already exists' not in (network_qos_dscp_rule.stderr | default(''))
+      with_subelements:
+        - "{{ cluster_config.network_qos_policies | default([]) }}"
+        - rules
+        - skip_missing: true
+      when:
+        - not ansible_check_mode
+        - item.1.type | default('') == 'dscp_marking'
+        - item.1.dscp_mark is defined
+
+    - name: Ensure Neutron minimum bandwidth QoS rules are present
+      ansible.builtin.command: >-
+        openstack --os-cloud {{ os_cloud }} network qos rule create
+        --type minimum-bandwidth
+        {% if item.1.direction is defined %}--{{ item.1.direction }}{% endif %}
+        --min-kbps {{ item.1.min_kbps }}
+        {{ item.0.name }}
+      register: network_qos_minimum_bandwidth_rule
+      changed_when: network_qos_minimum_bandwidth_rule.rc == 0
+      failed_when: network_qos_minimum_bandwidth_rule.rc != 0 and 'already exists' not in (network_qos_minimum_bandwidth_rule.stderr | default(''))
+      with_subelements:
+        - "{{ cluster_config.network_qos_policies | default([]) }}"
+        - rules
+        - skip_missing: true
+      when:
+        - not ansible_check_mode
+        - item.1.type | default('') == 'minimum_bandwidth'
+        - item.1.min_kbps is defined
+
+    - name: Ensure Cinder QoS specs are present
+      ansible.builtin.command: >-
+        openstack --os-cloud {{ os_cloud }} volume qos create
+        {% if item.consumer is defined %}--consumer {{ item.consumer }}{% endif %}
+        {% for key, value in (item.specs | default({})).items() %}--property {{ key }}={{ value }} {% endfor %}
+        {{ item.name }}
+      register: volume_qos_create
+      changed_when: volume_qos_create.rc == 0
+      failed_when: volume_qos_create.rc != 0 and 'already exists' not in (volume_qos_create.stderr | default(''))
+      loop: "{{ cluster_config.volume_qos | default([]) }}"
+      loop_control:
+        label: "{{ item.name }}"
+      when: not ansible_check_mode
+
+    - name: Ensure Cinder QoS spec properties are synchronized
+      ansible.builtin.command: >-
+        openstack --os-cloud {{ os_cloud }} volume qos set
+        {% for key, value in (item.specs | default({})).items() %}--property {{ key }}={{ value }} {% endfor %}
+        {{ item.name }}
+      register: volume_qos_set
+      changed_when: volume_qos_set.rc == 0
+      loop: "{{ cluster_config.volume_qos | default([]) }}"
+      loop_control:
+        label: "{{ item.name }}"
+      when:
+        - not ansible_check_mode
+        - item.specs | default({}) | length > 0
+
+    - name: Ensure Cinder volume types are present
+      ansible.builtin.command: >-
+        openstack --os-cloud {{ os_cloud }} volume type create
+        {% if item.description is defined %}--description {{ item.description | quote }}{% endif %}
+        {% if item.is_public is defined and not (item.is_public | bool) %}--private{% endif %}
+        {% for key, value in (item.extra_specs | default({})).items() %}--property {{ key }}={{ value }} {% endfor %}
+        {{ item.name }}
+      register: volume_type_create
+      changed_when: volume_type_create.rc == 0
+      failed_when: volume_type_create.rc != 0 and 'already exists' not in (volume_type_create.stderr | default(''))
+      loop: "{{ cluster_config.volume_types | default([]) }}"
+      loop_control:
+        label: "{{ item.name }}"
+      when: not ansible_check_mode
+
+    - name: Ensure Cinder volume type properties are synchronized
+      ansible.builtin.command: >-
+        openstack --os-cloud {{ os_cloud }} volume type set
+        {% for key, value in (item.extra_specs | default({})).items() %}--property {{ key }}={{ value }} {% endfor %}
+        {{ item.name }}
+      register: volume_type_set
+      changed_when: volume_type_set.rc == 0
+      loop: "{{ cluster_config.volume_types | default([]) }}"
+      loop_control:
+        label: "{{ item.name }}"
+      when:
+        - not ansible_check_mode
+        - item.extra_specs | default({}) | length > 0
+
+    - name: Ensure Cinder QoS specs are associated with volume types
+      ansible.builtin.command: >-
+        openstack --os-cloud {{ os_cloud }} volume qos associate {{ item.qos }} {{ item.name }}
+      register: volume_qos_associate
+      changed_when: volume_qos_associate.rc == 0
+      failed_when: volume_qos_associate.rc != 0 and 'already associated' not in (volume_qos_associate.stderr | default(''))
+      loop: "{{ cluster_config.volume_types | default([]) }}"
+      loop_control:
+        label: "{{ item.name }}"
+      when:
+        - not ansible_check_mode
+        - item.qos is defined
+
+    - name: Resolve Octavia profile compute flavor IDs
+      ansible.builtin.command: >-
+        openstack --os-cloud {{ os_cloud }} flavor show
+        {{ item.flavor_data.compute_flavor | quote }}
+        -f value -c id
+      register: octavia_profile_compute_flavors
+      changed_when: false
+      loop: "{{ cluster_config.octavia_flavor_profiles | default([]) }}"
+      loop_control:
+        label: "{{ item.name }}"
+      when:
+        - not ansible_check_mode
+        - item.flavor_data is defined
+        - item.flavor_data.compute_flavor is defined
+
+    - name: Ensure Octavia flavor profiles are present
+      ansible.builtin.command: >-
+        openstack --os-cloud {{ os_cloud }} loadbalancer flavorprofile create
+        --name {{ item.name }}
+        {% if item.provider is defined %}--provider {{ item.provider }}{% endif %}
+        {% if item.flavor_data is defined and item.flavor_data.compute_flavor is defined %}
+        {% set resolved = namespace(compute_flavor=item.flavor_data.compute_flavor) %}
+        {% for result in octavia_profile_compute_flavors.results | default([]) %}
+        {% if result.item.name == item.name and (result.stdout | default('') | length) > 0 %}
+        {% set resolved.compute_flavor = result.stdout %}
+        {% endif %}
+        {% endfor %}
+        --flavor-data {{ item.flavor_data | combine({'compute_flavor': resolved.compute_flavor}) | to_json | quote }}
+        {% elif item.flavor_data is defined %}--flavor-data {{ item.flavor_data | to_json | quote }}{% endif %}
+      register: octavia_profile_create
+      changed_when: octavia_profile_create.rc == 0
+      failed_when: octavia_profile_create.rc != 0 and 'already exists' not in (octavia_profile_create.stderr | default(''))
+      loop: "{{ cluster_config.octavia_flavor_profiles | default([]) }}"
+      loop_control:
+        label: "{{ item.name }}"
+      when: not ansible_check_mode
+
+    - name: Ensure Octavia flavors are present
+      ansible.builtin.command: >-
+        openstack --os-cloud {{ os_cloud }} loadbalancer flavor create
+        --name {{ item.name }}
+        {% if item.description is defined %}--description {{ item.description | quote }}{% endif %}
+        {% if item.enabled is defined and not (item.enabled | bool) %}--disable{% else %}--enable{% endif %}
+        --flavorprofile {{ item.flavor_profile }}
+      register: octavia_flavor_create
+      changed_when: octavia_flavor_create.rc == 0
+      failed_when: octavia_flavor_create.rc != 0 and 'already exists' not in (octavia_flavor_create.stderr | default(''))
+      loop: "{{ cluster_config.octavia_flavors | default([]) }}"
+      loop_control:
+        label: "{{ item.name }}"
+      when:
+        - not ansible_check_mode
+        - item.flavor_profile is defined
